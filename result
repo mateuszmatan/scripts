@@ -1,6 +1,300 @@
-Process-Pkcs12Keystore : Cannot bind argument to parameter 'DefaultPasswords' because it is null.
-At C:\Scripts\search_win.ps1:267 char:85
-+ ... rocess-Pkcs12Keystore -File $file -DefaultPasswords $DefaultPasswords
-+                                                         ~~~~~~~~~~~~~~~~~
-    + CategoryInfo          : InvalidData: (:) [Process-Pkcs12Keystore], ParameterBindingValidationException
-    + FullyQualifiedErrorId : ParameterArgumentValidationErrorNullNotAllowed,Process-Pkcs12Keystore
+# ==============================================================================
+# Script to find and analyze certificates on the filesystem using native PowerShell.
+# V9: Fixed null parameter error by explicitly passing passwords into Main.
+# ==============================================================================
+
+# --- Configuration ---
+$OutputFile = "certificate_report_windows.json"
+$SearchPath = "C:\certs2" # Path to scan. Can be changed to e.g., "C:\Users" for a faster scan.
+
+# List of default passwords to try on keystores (.p12, .jks)
+$DefaultPasswords = @(
+    "changeit",
+    "password",
+    "secret",
+    "keystore",
+    $null, # Represents no password
+    ""     # Represents an empty password
+)
+
+# --- Global Data ---
+$CurrentMachineName = $env:COMPUTERNAME
+$CurrentMachineIP = (Get-NetIPAddress -AddressFamily IPv4 -InterfaceAlias (Get-NetAdapter -Physical).Name | Where-Object { $_.AddressState -eq 'Preferred' }).IPAddress | Select-Object -First 1
+
+# ==============================================================================
+# Function: Converts a certificate object to a PSCustomObject for further processing.
+# ==============================================================================
+Function Convert-CertificateToCustomObject {
+    param(
+        [Parameter(Mandatory=$true)]
+        [System.Security.Cryptography.X509Certificates.X509Certificate2]$Certificate,
+        [Parameter(Mandatory=$true)]
+        [string]$FilePath,
+        [string]$Alias
+    )
+
+    $now = Get-Date
+    $statusText = ""
+    $statusColor = ""
+    $isValid = $false
+    $daysRemaining = (New-TimeSpan -Start $now -End $Certificate.NotAfter).Days
+
+    if ($now -lt $Certificate.NotBefore) {
+        $statusText = "INACTIVE (Not yet valid)"
+        $statusColor = "Red"
+    } elseif ($now -gt $Certificate.NotAfter) {
+        $statusText = "EXPIRED"
+        $statusColor = "Red"
+    } else {
+        $isValid = $true
+        if ($daysRemaining -le 30) {
+            $statusText = "VALID (Expires in $($daysRemaining) days!)"
+            $statusColor = "Yellow"
+        } else {
+            $statusText = "VALID (Expires in $($daysRemaining) days)"
+            $statusColor = "Green"
+        }
+    }
+    
+    # Display human-readable information in the console
+    Write-Host "Certificate Details:" -ForegroundColor Green
+    if ($Alias) {
+        Write-Host "     Alias:   $Alias"
+    }
+    Write-Host "     Issuer:  $($Certificate.Issuer)"
+    Write-Host "     Status:  " -NoNewline; Write-Host $statusText -ForegroundColor $statusColor
+    Write-Host "     Validity:From $($Certificate.NotBefore.ToString('yyyy-MM-dd')) to $($Certificate.NotAfter.ToString('yyyy-MM-dd'))"
+
+    # Returns an object that will be converted to JSON
+    return [PSCustomObject]@{
+        filePath           = $FilePath
+        alias              = $Alias
+        issuer             = $Certificate.Issuer
+        subject            = $Certificate.Subject
+        validFrom          = $Certificate.NotBefore.ToUniversalTime().ToString("u").Replace(" ", "T")
+        validTo            = $Certificate.NotAfter.ToUniversalTime().ToString("u").Replace(" ", "T")
+        isValid            = $isValid
+        daysRemaining      = if ($daysRemaining -lt 0) { 0 } else { $daysRemaining }
+        thumbprint         = $Certificate.Thumbprint
+        currentMachineName = $CurrentMachineName
+        currentMachineIP   = $CurrentMachineIP
+    }
+}
+
+# ==============================================================================
+# Function: Creates an error object to be saved in JSON.
+# ==============================================================================
+Function New-ErrorObject {
+    param(
+        [Parameter(Mandatory=$true)]
+        [string]$FilePath,
+        [Parameter(Mandatory=$true)]
+        [string]$ErrorMessage
+    )
+    
+    # Display the error in the console
+    Write-Host "Error Found:" -ForegroundColor Red
+    Write-Host "     File:  $FilePath"
+    Write-Host "     Error: $($ErrorMessage.Trim())"
+
+    return [PSCustomObject]@{
+        filePath           = $FilePath
+        error              = $ErrorMessage.Trim()
+        currentMachineName = $CurrentMachineName
+        currentMachineIP   = $CurrentMachineIP
+    }
+}
+
+# ==============================================================================
+# Function: Processes standard certificate files (.cer, .crt, .pem, etc.)
+# ==============================================================================
+Function Process-StandardCertificate {
+    param(
+        [Parameter(Mandatory=$true)]
+        [System.IO.FileInfo]$File
+    )
+    try {
+        $cert = New-Object System.Security.Cryptography.X509Certificates.X509Certificate2($File.FullName)
+        return @(Convert-CertificateToCustomObject -Certificate $cert -FilePath $File.FullName)
+    } catch {
+        return @(New-ErrorObject -FilePath $File.FullName -ErrorMessage $_.Exception.Message)
+    }
+}
+
+# ==============================================================================
+# Function: Processes PKCS#12 keystore files (.pfx, .p12)
+# ==============================================================================
+Function Process-Pkcs12Keystore {
+    param(
+        [Parameter(Mandatory=$true)]
+        [System.IO.FileInfo]$File,
+        [Parameter(Mandatory=$true)]
+        [array]$DefaultPasswords
+    )
+    
+    $foundResults = [System.Collections.Generic.List[object]]::new()
+    $foundInKeystore = $false
+
+    foreach ($pass in $DefaultPasswords) {
+        try {
+            $collection = New-Object System.Security.Cryptography.X509Certificates.X509Certificate2Collection
+            $collection.Import($File.FullName, $pass, "Exportable,UserKeySet")
+            
+            if ($collection.Count -gt 0) {
+                $foundInKeystore = $true
+                foreach ($cert in $collection) {
+                    if ($cert.HasPrivateKey) {
+                        $foundResults.Add((Convert-CertificateToCustomObject -Certificate $cert -FilePath $File.FullName -Alias "Cert with Private Key"))
+                    }
+                }
+                break # Exit password loop if successful
+            }
+        } catch {
+            # Ignore incorrect password errors and try the next one
+        }
+    }
+
+    if (-not $foundInKeystore) {
+        $foundResults.Add((New-ErrorObject -FilePath $File.FullName -ErrorMessage "Could not access PKCS#12 keystore. Tried default passwords."))
+    }
+    return $foundResults
+}
+
+# ==============================================================================
+# Function: Processes Java KeyStore files (.jks, .keystore)
+# ==============================================================================
+Function Process-JavaKeystore {
+    param(
+        [Parameter(Mandatory=$true)]
+        [System.IO.FileInfo]$File,
+        [Parameter(Mandatory=$true)]
+        [array]$DefaultPasswords,
+        [bool]$HasKeytool
+    )
+
+    $foundResults = [System.Collections.Generic.List[object]]::new()
+
+    if (-not $HasKeytool) {
+        $foundResults.Add((New-ErrorObject -FilePath $File.FullName -ErrorMessage "keytool.exe is not available; the certificate cannot be scanned."))
+        return $foundResults
+    }
+    
+    $workingPass = $null
+    $aliases = @()
+
+    foreach ($pass in $DefaultPasswords) {
+        $keytoolArgs = @('-list', '-v', '-keystore', $File.FullName)
+        if (-not [string]::IsNullOrEmpty($pass)) {
+            $keytoolArgs += @('-storepass', $pass)
+        }
+        $listOutput = & keytool @keytoolArgs 2>&1
+        
+        if ($LASTEXITCODE -eq 0) {
+            $workingPass = $pass
+            $aliases = $listOutput | Where-Object { $_ -match 'Alias name:' } | ForEach-Object { $_.Split(':')[1].Trim() }
+            break
+        }
+    }
+
+    if ($aliases.Count -gt 0) {
+        foreach ($alias in $aliases) {
+             $exportArgs = @('-exportcert', '-alias', $alias, '-keystore', $File.FullName, '-rfc')
+             if (-not [string]::IsNullOrEmpty($workingPass)) {
+                 $exportArgs += @('-storepass', $workingPass)
+             }
+             $certPem = & keytool @exportArgs 2>&1
+
+             if ($LASTEXITCODE -eq 0) {
+                 $certBytes = [System.Text.Encoding]::UTF8.GetBytes($certPem)
+                 $cert = New-Object System.Security.Cryptography.X509Certificates.X509Certificate2($certBytes)
+                 $foundResults.Add((Convert-CertificateToCustomObject -Certificate $cert -FilePath $File.FullName -Alias $alias))
+             } else {
+                 $foundResults.Add((New-ErrorObject -FilePath "$($File.FullName) (alias: $alias)" -ErrorMessage "Failed to export certificate from JKS: $certPem"))
+             }
+        }
+    } else {
+        $foundResults.Add((New-ErrorObject -FilePath $File.FullName -ErrorMessage "Could not access JKS keystore or it contains no aliases. Tried default passwords."))
+    }
+    return $foundResults
+}
+
+
+# ==============================================================================
+# Main script logic
+# ==============================================================================
+Function Main {
+    # FIX: Added a param block to accept the password list explicitly.
+    param (
+        [array]$PasswordList
+    )
+
+    Write-Host "Starting certificate scan on '$SearchPath'..." -ForegroundColor Cyan
+    $hasKeytool = (Get-Command keytool -ErrorAction SilentlyContinue)
+
+    if (-not $hasKeytool) {
+        Write-Host "INFO: 'keytool.exe' not found. Java KeyStore files (.jks) will be reported as unscannable." -ForegroundColor Yellow
+    }
+
+    $allResults = [System.Collections.Generic.List[object]]::new()
+    $extensions = @("*.cer", "*.crt", "*.der", "*.pem", "*.p7b", "*.p7c", "*.pfx", "*.p12", "*.jks", "*.keystore")
+    
+    Get-ChildItem -Path $SearchPath -Recurse -Include $extensions -ErrorAction SilentlyContinue | ForEach-Object {
+        $file = $_
+        Write-Host "----------------------------------------------------------------------"
+        Write-Host "Processing: $($file.FullName)" -ForegroundColor White
+        
+        $fileResults = @()
+        
+        switch -Wildcard ($file.Extension.ToLower()) {
+            ".cer" {
+                $fileResults = Process-StandardCertificate -File $file
+            }
+            ".crt" {
+                $fileResults = Process-StandardCertificate -File $file
+            }
+            ".der" {
+                $fileResults = Process-StandardCertificate -File $file
+            }
+            ".pem" {
+                $fileResults = Process-StandardCertificate -File $file
+            }
+            ".p7b" {
+                $fileResults = Process-StandardCertificate -File $file
+            }
+            ".p7c" {
+                $fileResults = Process-StandardCertificate -File $file
+            }
+            ".pfx" {
+                # FIX: Using the $PasswordList parameter passed into Main.
+                $fileResults = Process-Pkcs12Keystore -File $file -DefaultPasswords $PasswordList
+            }
+            ".p12" {
+                # FIX: Using the $PasswordList parameter passed into Main.
+                $fileResults = Process-Pkcs12Keystore -File $file -DefaultPasswords $PasswordList
+            }
+            ".jks" {
+                # FIX: Using the $PasswordList parameter passed into Main.
+                $fileResults = Process-JavaKeystore -File $file -DefaultPasswords $PasswordList -HasKeytool $hasKeytool
+            }
+            ".keystore" {
+                # FIX: Using the $PasswordList parameter passed into Main.
+                $fileResults = Process-JavaKeystore -File $file -DefaultPasswords $PasswordList -HasKeytool $hasKeytool
+            }
+        }
+        if ($fileResults) {
+            foreach ($result in $fileResults) {
+                $allResults.Add($result)
+            }
+        }
+    }
+    
+    $allResults | ConvertTo-Json -Depth 5 | Out-File -FilePath $OutputFile -Encoding utf8
+    
+    Write-Host ""
+    Write-Host "Finished. Results have been saved to: " -ForegroundColor Cyan -NoNewline
+    Write-Host $OutputFile -ForegroundColor White
+}
+
+# --- Script Execution ---
+# FIX: Pass the global $DefaultPasswords array into the Main function.
+Main -PasswordList $DefaultPasswords
