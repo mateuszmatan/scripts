@@ -1,11 +1,16 @@
 # ==============================================================================
 # Script to find and analyze certificates on the filesystem using native PowerShell.
-# V15: Replaced incompatible input redirection with a compatible pipe from $null.
+# V16: Improved PFX handling and added a configurable -Path parameter.
 # ==============================================================================
+
+# --- Script Parameters ---
+param(
+    [Parameter(Mandatory=$true, HelpMessage="The directory path to search for certificates.")]
+    [string]$Path
+)
 
 # --- Configuration ---
 $OutputFile = "certificate_report_windows.json"
-$SearchPath = "C:\certs" # Path to scan. Can be changed to e.g., "C:\Users" for a faster scan.
 
 # List of default passwords to try on keystores (.p12, .jks)
 $DefaultPasswords = @(
@@ -141,10 +146,10 @@ Function Process-Pkcs12Keystore {
             
             if ($collection.Count -gt 0) {
                 $foundInKeystore = $true
+                # FIX: Process ALL certificates in the collection, not just those with private keys.
                 foreach ($cert in $collection) {
-                    if ($cert.HasPrivateKey) {
-                        $foundResults.Add((Convert-CertificateToCustomObject -Certificate $cert -FilePath $File.FullName -Alias "Cert with Private Key"))
-                    }
+                    $alias_name = if($cert.FriendlyName){$cert.FriendlyName} else {$cert.Subject}
+                    $foundResults.Add((Convert-CertificateToCustomObject -Certificate $cert -FilePath $File.FullName -Alias $alias_name))
                 }
                 break # Exit password loop if successful
             }
@@ -185,7 +190,6 @@ Function Process-JavaKeystore {
         if (-not [string]::IsNullOrEmpty($pass)) {
             $keytoolArgs += @('-storepass', $pass)
         }
-        # FIX: Replaced incompatible '<' operator with '$null |' for non-interactive execution.
         $listOutput = $null | & $KeytoolCommand.Source @keytoolArgs 2>&1
         
         if ($LASTEXITCODE -eq 0) {
@@ -201,7 +205,6 @@ Function Process-JavaKeystore {
              if (-not [string]::IsNullOrEmpty($workingPass)) {
                  $exportArgs += @('-storepass', $workingPass)
              }
-             # FIX: Replaced incompatible '<' operator with '$null |' for non-interactive execution.
              $certPem = $null | & $KeytoolCommand.Source @exportArgs 2>&1
 
              if ($LASTEXITCODE -eq 0) {
@@ -232,6 +235,10 @@ Function Process-JavaKeystore {
 # Main script logic
 # ==============================================================================
 Function Main {
+    param(
+        [string]$SearchPath
+    )
+
     Write-Host "Starting certificate scan on '$SearchPath'..." -ForegroundColor Cyan
     $keytoolCmd = Get-Command keytool -ErrorAction SilentlyContinue
 
@@ -240,7 +247,7 @@ Function Main {
     }
 
     $allResults = [System.Collections.Generic.List[object]]::new()
-    $extensions = @("*.cer", "*.crt", ".der", ".pem", ".p7b", ".p7c", ".pfx", ".p12", ".jks", ".keystore")
+    $extensions = @("*.cer", "*.crt", ".der", ".pem", ".p7b", ".p7c", "*.pfx", ".p12", ".jks", ".keystore")
     
     Get-ChildItem -Path $SearchPath -Recurse -Include $extensions -ErrorAction SilentlyContinue | ForEach-Object {
         $file = $_
@@ -276,4 +283,4 @@ Function Main {
 }
 
 # --- Script Execution ---
-Main
+Main -SearchPath $Path
