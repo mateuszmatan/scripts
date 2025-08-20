@@ -1,6 +1,6 @@
 # ==============================================================================
 # Script to find and analyze certificates on the filesystem using native PowerShell.
-# V16: Improved PFX handling and added a configurable -Path parameter.
+# V17: Adds a Test-Path diagnostic check to verify file accessibility.
 # ==============================================================================
 
 # --- Script Parameters ---
@@ -119,6 +119,13 @@ Function Process-StandardCertificate {
         [Parameter(Mandatory=$true)]
         [System.IO.FileInfo]$File
     )
+
+    # DIAGNOSTIC: Verify the file is accessible before trying to open it.
+    if (-not (Test-Path -LiteralPath $File.FullName -PathType Leaf)) {
+        $errorMessage = "File found, but Test-Path failed. Check for long paths, special characters, or permission issues."
+        return @(New-ErrorObject -FilePath $File.FullName -ErrorMessage $errorMessage)
+    }
+
     try {
         $cert = [System.Security.Cryptography.X509Certificates.X509Certificate2]::new($File.FullName)
         return @(Convert-CertificateToCustomObject -Certificate $cert -FilePath $File.FullName)
@@ -136,6 +143,12 @@ Function Process-Pkcs12Keystore {
         [System.IO.FileInfo]$File
     )
     
+    # DIAGNOSTIC: Verify the file is accessible before trying to open it.
+    if (-not (Test-Path -LiteralPath $File.FullName -PathType Leaf)) {
+        $errorMessage = "File found, but Test-Path failed. Check for long paths, special characters, or permission issues."
+        return @(New-ErrorObject -FilePath $File.FullName -ErrorMessage $errorMessage)
+    }
+
     $foundResults = [System.Collections.Generic.List[object]]::new()
     $foundInKeystore = $false
 
@@ -146,16 +159,13 @@ Function Process-Pkcs12Keystore {
             
             if ($collection.Count -gt 0) {
                 $foundInKeystore = $true
-                # FIX: Process ALL certificates in the collection, not just those with private keys.
                 foreach ($cert in $collection) {
                     $alias_name = if($cert.FriendlyName){$cert.FriendlyName} else {$cert.Subject}
                     $foundResults.Add((Convert-CertificateToCustomObject -Certificate $cert -FilePath $File.FullName -Alias $alias_name))
                 }
-                break # Exit password loop if successful
+                break
             }
-        } catch {
-            # Ignore incorrect password errors and try the next one
-        }
+        } catch {}
     }
 
     if (-not $foundInKeystore) {
@@ -174,6 +184,12 @@ Function Process-JavaKeystore {
         [Parameter(Mandatory=$true)]
         [System.Management.Automation.CommandInfo]$KeytoolCommand
     )
+
+    # DIAGNOSTIC: Verify the file is accessible before trying to open it.
+    if (-not (Test-Path -LiteralPath $File.FullName -PathType Leaf)) {
+        $errorMessage = "File found, but Test-Path failed. Check for long paths, special characters, or permission issues."
+        return @(New-ErrorObject -FilePath $File.FullName -ErrorMessage $errorMessage)
+    }
 
     $foundResults = [System.Collections.Generic.List[object]]::new()
 
@@ -247,7 +263,7 @@ Function Main {
     }
 
     $allResults = [System.Collections.Generic.List[object]]::new()
-    $extensions = @("*.cer", "*.crt", ".der", ".pem", ".p7b", ".p7c", "*.pfx", ".p12", ".jks", ".keystore")
+    $extensions = @("*.cer", "*.crt", ".der", ".pem", "*.p7b", ".p7c", "*.pfx", ".p12", ".jks", ".keystore")
     
     Get-ChildItem -Path $SearchPath -Recurse -Include $extensions -ErrorAction SilentlyContinue | ForEach-Object {
         $file = $_
