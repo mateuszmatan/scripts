@@ -5,7 +5,7 @@
 
 # --- Configuration ---
 $OutputFile = "certificate_report_windows.json"
-$SearchPath = "C:\" # Path to scan. Can be changed to e.g., "C:\Users" for a faster scan.
+$SearchPath = "C:\certs2" # Path to scan. Can be changed to e.g., "C:\Users" for a faster scan.
 
 # List of default passwords to try on keystores (.p12, .jks)
 $DefaultPasswords = @(
@@ -242,13 +242,27 @@ Function Main {
         
         # FIX: Corrected the switch statement to use commas instead of -or
         switch -Wildcard ($file.Extension.ToLower()) {
-            ".cer", ".crt", ".der", ".pem", ".p7b", ".p7c" {
+            ".cer"{
+                $fileResults = Process-StandardCertificate -File $file
+            } ".crt"{
+                $fileResults = Process-StandardCertificate -File $file
+            } ".der"{
+                $fileResults = Process-StandardCertificate -File $file
+            } ".pem"{
+                $fileResults = Process-StandardCertificate -File $file
+            } ".p7b"{
+                $fileResults = Process-StandardCertificate -File $file
+            } ".p7c" {
                 $fileResults = Process-StandardCertificate -File $file
             }
-            ".pfx", ".p12" {
+            ".pfx"{
+                $fileResults = Process-Pkcs12Keystore -File $file -DefaultPasswords $DefaultPasswords
+            } ".p12" {
                 $fileResults = Process-Pkcs12Keystore -File $file -DefaultPasswords $DefaultPasswords
             }
-            ".jks", ".keystore" {
+            ".jks"{
+                $fileResults = Process-JavaKeystore -File $file -DefaultPasswords $DefaultPasswords -HasKeytool $hasKeytool
+            } ".keystore" {
                 $fileResults = Process-JavaKeystore -File $file -DefaultPasswords $DefaultPasswords -HasKeytool $hasKeytool
             }
         }
