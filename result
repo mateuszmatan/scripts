@@ -1,13 +1,7 @@
 # ==============================================================================
 # Script to find and analyze certificates on the filesystem using native PowerShell.
-# V19: Adds enhanced error catching and logging to debug script termination.
+# V20: Automatically scans all local fixed disks (C:, D:, etc.).
 # ==============================================================================
-
-# --- Script Parameters ---
-param(
-    [Parameter(Mandatory=$true, HelpMessage="The directory path to search for certificates.")]
-    [string]$Path
-)
 
 # --- Configuration ---
 $OutputFile = "certificate_report_windows.json"
@@ -123,14 +117,7 @@ Function Process-StandardCertificate {
         $fileBytes = [System.IO.File]::ReadAllBytes($File.FullName)
         $cert = [System.Security.Cryptography.X509Certificates.X509Certificate2]::new($fileBytes)
         return @(Convert-CertificateToCustomObject -Certificate $cert -FilePath $File.FullName)
-    }
-    # DIAGNOSTIC: Add specific catch block with logging
-    catch [System.Security.Cryptography.CryptographicException] {
-        Write-Host "DEBUG: Caught a CryptographicException for file $($File.FullName)" -ForegroundColor Yellow
-        return @(New-ErrorObject -FilePath $File.FullName -ErrorMessage $_.Exception.Message)
-    }
-    catch {
-        Write-Host "DEBUG: Caught a generic error for file $($File.FullName)" -ForegroundColor Yellow
+    } catch {
         return @(New-ErrorObject -FilePath $File.FullName -ErrorMessage $_.Exception.Message)
     }
 }
@@ -161,7 +148,7 @@ Function Process-Pkcs12Keystore {
                         $alias_name = if($cert.FriendlyName){$cert.FriendlyName} else {$cert.Subject}
                         $foundResults.Add((Convert-CertificateToCustomObject -Certificate $cert -FilePath $File.FullName -Alias $alias_name))
                     }
-                    break
+                    break 
                 }
             } catch {
                 # This inner catch ignores incorrect password errors.
@@ -172,6 +159,7 @@ Function Process-Pkcs12Keystore {
             $foundResults.Add((New-ErrorObject -FilePath $File.FullName -ErrorMessage "Could not access PKCS#12 keystore. Tried default passwords."))
         }
     } catch {
+        # This outer catch handles errors reading the file itself.
         $foundResults.Add((New-ErrorObject -FilePath $File.FullName -ErrorMessage $_.Exception.Message))
     }
     
@@ -248,49 +236,52 @@ Function Process-JavaKeystore {
 # Main script logic
 # ==============================================================================
 Function Main {
-    param(
-        [string]$SearchPath
-    )
-
-    Write-Host "Starting certificate scan on '$SearchPath'..." -ForegroundColor Cyan
+    Write-Host "Starting certificate scan on all local disks..." -ForegroundColor Cyan
     $keytoolCmd = Get-Command keytool -ErrorAction SilentlyContinue
 
     if (-not $keytoolCmd) {
         Write-Host "INFO: 'keytool.exe' not found. Java KeyStore files (.jks) will be reported as unscannable." -ForegroundColor Yellow
     }
 
+    # Get all local fixed disks (e.g., C:, D:)
+    $localDisks = Get-CimInstance -ClassName Win32_LogicalDisk -Filter "DriveType=3"
+    Write-Host "Found local disks to scan: $($localDisks.DeviceID -join ', ')" -ForegroundColor Cyan
+
     $allResults = [System.Collections.Generic.List[object]]::new()
-    $extensions = @("*.cer", "*.crt", ".der", ".pem", "*.p7b", "*.p7c", "*.pfx", ".p12", ".jks", "*.keystore")
+    $extensions = @("*.cer", "*.crt", "*.der", "*.pem", "*.p7b", "*.p7c", "*.pfx", "*.p12", "*.jks", "*.keystore")
     
-    Get-ChildItem -Path $SearchPath -Recurse -Include $extensions -ErrorAction SilentlyContinue | ForEach-Object {
-        $file = $_
-        Write-Host "----------------------------------------------------------------------"
-        Write-Host "Processing: $($file.FullName)" -ForegroundColor White
-        
-        $fileResults = @()
-        
-        switch -Wildcard ($file.Extension.ToLower()) {
-            ".cer"      { $fileResults = Process-StandardCertificate -File $file }
-            ".crt"      { $fileResults = Process-StandardCertificate -File $file }
-            ".der"      { $fileResults = Process-StandardCertificate -File $file }
-            ".pem"      { $fileResults = Process-StandardCertificate -File $file }
-            ".p7b"      { $fileResults = Process-StandardCertificate -File $file }
-            ".p7c"      { $fileResults = Process-StandardCertificate -File $file }
-            ".pfx"      { $fileResults = Process-Pkcs12Keystore -File $file }
-            ".p12"      { $fileResults = Process-Pkcs12Keystore -File $file }
-            ".jks"      { $fileResults = Process-JavaKeystore -File $file -KeytoolCommand $keytoolCmd }
-            ".keystore" { $fileResults = Process-JavaKeystore -File $file -KeytoolCommand $keytoolCmd }
-        }
-        if ($fileResults) {
-            foreach ($result in $fileResults) {
-                $allResults.Add($result)
+    # Loop through each disk and scan it
+    foreach ($disk in $localDisks) {
+        $searchPath = Join-Path -Path $disk.DeviceID -ChildPath "\"
+        Write-Host "--- Now scanning disk: $searchPath ---" -ForegroundColor Cyan
+
+        Get-ChildItem -Path $searchPath -Recurse -Include $extensions -ErrorAction SilentlyContinue | ForEach-Object {
+            $file = $_
+            Write-Host "----------------------------------------------------------------------"
+            Write-Host "Processing: $($file.FullName)" -ForegroundColor White
+            
+            $fileResults = @()
+            
+            switch -Wildcard ($file.Extension.ToLower()) {
+                ".cer"      { $fileResults = Process-StandardCertificate -File $file }
+                ".crt"      { $fileResults = Process-StandardCertificate -File $file }
+                ".der"      { $fileResults = Process-StandardCertificate -File $file }
+                ".pem"      { $fileResults = Process-StandardCertificate -File $file }
+                ".p7b"      { $fileResults = Process-StandardCertificate -File $file }
+                ".p7c"      { $fileResults = Process-StandardCertificate -File $file }
+                ".pfx"      { $fileResults = Process-Pkcs12Keystore -File $file }
+                ".p12"      { $fileResults = Process-Pkcs12Keystore -File $file }
+                ".jks"      { $fileResults = Process-JavaKeystore -File $file -KeytoolCommand $keytoolCmd }
+                ".keystore" { $fileResults = Process-JavaKeystore -File $file -KeytoolCommand $keytoolCmd }
+            }
+            if ($fileResults) {
+                foreach ($result in $fileResults) {
+                    $allResults.Add($result)
+                }
             }
         }
     }
     
-    # DIAGNOSTIC: Add logging before the final command
-    Write-Host "DEBUG: Reached the end of the Main function. Attempting to write $($allResults.Count) results to JSON file..." -ForegroundColor Magenta
-
     $allResults | ConvertTo-Json -Depth 5 | Out-File -FilePath $OutputFile -Encoding utf8
     
     Write-Host ""
@@ -299,4 +290,4 @@ Function Main {
 }
 
 # --- Script Execution ---
-Main -SearchPath $Path
+Main
