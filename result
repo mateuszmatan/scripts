@@ -1,0 +1,18 @@
+At C:\Scripts\search_win.ps1:193 char:130
++ ... -alias `"$alias`" -keystore `"$($file.FullName)`" $passArg -rfc 2>&1"
++                                                                     ~~~~
+The error stream for this command is already redirected.
+At C:\Scripts\search_win.ps1:216 char:57
++ ... ished. Results have been saved to: " -ForegroundColor Cyan -NoNewline
++                                        ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+The string is missing the terminator: ".
+At C:\Scripts\search_win.ps1:132 char:114
++ ... -Include $extensions -ErrorAction SilentlyContinue | ForEach-Object {
++                                                                         ~
+Missing closing '}' in statement block or type definition.
+At C:\Scripts\search_win.ps1:118 char:15
++ Function Main {
++               ~
+Missing closing '}' in statement block or type definition.
+    + CategoryInfo          : ParserError: (:) [], ParseException
+    + FullyQualifiedErrorId : StreamAlreadyRedirected
