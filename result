@@ -1,3 +1,5 @@
+this is currently working script. password passing null issue is resolved by global table. script is presented below please work on it now:
+
 # ==============================================================================
 # Script to find and analyze certificates on the filesystem using native PowerShell.
 # V11: Final correction for variable scope issue inside the Main function's loop.
@@ -130,9 +132,7 @@ Function Process-StandardCertificate {
 Function Process-Pkcs12Keystore {
     param(
         [Parameter(Mandatory=$true)]
-        [System.IO.FileInfo]$File,
-        [Parameter(Mandatory=$true)]
-        [array]$DefaultPasswords
+        [System.IO.FileInfo]$File
     )
     
     $foundResults = [System.Collections.Generic.List[object]]::new()
@@ -170,8 +170,6 @@ Function Process-JavaKeystore {
     param(
         [Parameter(Mandatory=$true)]
         [System.IO.FileInfo]$File,
-        [Parameter(Mandatory=$true)]
-        [array]$DefaultPasswords,
         [Parameter(Mandatory=$true)]
         [System.Management.Automation.CommandInfo]$KeytoolCommand
     )
@@ -227,15 +225,6 @@ Function Process-JavaKeystore {
 # Main script logic
 # ==============================================================================
 Function Main {
-    param (
-        [array]$PasswordList
-    )
-
-    if ($null -eq $PasswordList) {
-        Write-Host "FATAL ERROR: The password list was not provided to the Main function. Stopping execution." -ForegroundColor Red
-        return # Stop the function
-    }
-
     Write-Host "Starting certificate scan on '$SearchPath'..." -ForegroundColor Cyan
     $keytoolCmd = Get-Command keytool -ErrorAction SilentlyContinue
 
@@ -260,10 +249,10 @@ Function Main {
             ".pem"      { $fileResults = Process-StandardCertificate -File $file }
             ".p7b"      { $fileResults = Process-StandardCertificate -File $file }
             ".p7c"      { $fileResults = Process-StandardCertificate -File $file }
-            ".pfx"      { $fileResults = Process-Pkcs12Keystore -File $file -DefaultPasswords $PasswordList }
-            ".p12"      { $fileResults = Process-Pkcs12Keystore -File $file -DefaultPasswords $PasswordList }
-            ".jks"      { $fileResults = Process-JavaKeystore -File $file -DefaultPasswords $PasswordList -KeytoolCommand $keytoolCmd }
-            ".keystore" { $fileResults = Process-JavaKeystore -File $file -DefaultPasswords $PasswordList -KeytoolCommand $keytoolCmd }
+            ".pfx"      { $fileResults = Process-Pkcs12Keystore -File $file }
+            ".p12"      { $fileResults = Process-Pkcs12Keystore -File $file }
+            ".jks"      { $fileResults = Process-JavaKeystore -File $file -KeytoolCommand $keytoolCmd }
+            ".keystore" { $fileResults = Process-JavaKeystore -File $file -KeytoolCommand $keytoolCmd }
         }
         if ($fileResults) {
             foreach ($result in $fileResults) {
@@ -280,4 +269,21 @@ Function Main {
 }
 
 # --- Script Execution ---
-Main -PasswordList $DefaultPasswords
+Main
+
+
+now during parsing jks i have such error:
+New-Object : Cannot find an overload for "X509Certificate2" and the argument count: "2608".
+At C:\Scripts\search_win.ps1:209 char:26
++ ...     $cert = New-Object System.Security.Cryptography.X509Certificates. ...
++                 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+    + CategoryInfo          : InvalidOperation: (:) [New-Object], MethodException
+    + FullyQualifiedErrorId : ConstructorInvokedThrowException,Microsoft.PowerShell.Commands.NewObjectCommand
+
+Convert-CertificateToCustomObject : Cannot bind argument to parameter 'Certificate' because it is null.
+At C:\Scripts\search_win.ps1:210 char:84
++ ... lts.Add((Convert-CertificateToCustomObject -Certificate $cert -FilePa ...
++                                                             ~~~~~
+    + CategoryInfo          : InvalidData: (:) [Convert-CertificateToCustomObject], ParameterBindingValidationExceptio
+   n
+    + FullyQualifiedErrorId : ParameterArgumentValidationErrorNullNotAllowed,Convert-CertificateToCustomObject
