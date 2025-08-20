@@ -1,8 +1,6 @@
-this is currently working script. password passing null issue is resolved by global table. script is presented below please work on it now:
-
 # ==============================================================================
 # Script to find and analyze certificates on the filesystem using native PowerShell.
-# V11: Final correction for variable scope issue inside the Main function's loop.
+# V12: Fixed JKS parsing by joining multi-line keytool output into a single string.
 # ==============================================================================
 
 # --- Configuration ---
@@ -36,8 +34,6 @@ Function Convert-CertificateToCustomObject {
     )
 
     $now = Get-Date
-    # Using the current date of August 20, 2025
-    # $now = [datetime]"2025-08-20T10:46:21"
 
     $statusText = ""
     $statusColor = ""
@@ -207,7 +203,9 @@ Function Process-JavaKeystore {
              $certPem = & $KeytoolCommand.Source @exportArgs 2>&1
 
              if ($LASTEXITCODE -eq 0) {
-                 $certBytes = [System.Text.Encoding]::UTF8.GetBytes($certPem)
+                 # FIX: Join the array of lines from keytool into a single string
+                 $singlePemString = $certPem -join "`n"
+                 $certBytes = [System.Text.Encoding]::UTF8.GetBytes($singlePemString)
                  $cert = New-Object System.Security.Cryptography.X509Certificates.X509Certificate2($certBytes)
                  $foundResults.Add((Convert-CertificateToCustomObject -Certificate $cert -FilePath $File.FullName -Alias $alias))
              } else {
@@ -270,20 +268,3 @@ Function Main {
 
 # --- Script Execution ---
 Main
-
-
-now during parsing jks i have such error:
-New-Object : Cannot find an overload for "X509Certificate2" and the argument count: "2608".
-At C:\Scripts\search_win.ps1:209 char:26
-+ ...     $cert = New-Object System.Security.Cryptography.X509Certificates. ...
-+                 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-    + CategoryInfo          : InvalidOperation: (:) [New-Object], MethodException
-    + FullyQualifiedErrorId : ConstructorInvokedThrowException,Microsoft.PowerShell.Commands.NewObjectCommand
-
-Convert-CertificateToCustomObject : Cannot bind argument to parameter 'Certificate' because it is null.
-At C:\Scripts\search_win.ps1:210 char:84
-+ ... lts.Add((Convert-CertificateToCustomObject -Certificate $cert -FilePa ...
-+                                                             ~~~~~
-    + CategoryInfo          : InvalidData: (:) [Convert-CertificateToCustomObject], ParameterBindingValidationExceptio
-   n
-    + FullyQualifiedErrorId : ParameterArgumentValidationErrorNullNotAllowed,Convert-CertificateToCustomObject
