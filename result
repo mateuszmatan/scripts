@@ -2,13 +2,13 @@
 
 # ==============================================================================
 # Script to find and analyze certificates on the filesystem using standard tools.
-# V9: Removes icons from console output and adds a passwordless fallback for .p12 files.
+# V10: Adds an explicit passwordless 'keytool' fallback for JKS files.
 # ==============================================================================
 
 # --- Configuration ---
-OUTPUT_FILE="certificate_report_v9.json"
-# List of default passwords to try when opening keystores
-DEFAULT_PASSWORDS=("changeit" "password" "secret" "keystore" "") 
+OUTPUT_FILE="certificate_report_v10.json"
+# Passwords to try (passwordless attempt is now a separate fallback)
+DEFAULT_PASSWORDS=("changeit" "password" "secret" "keystore") 
 
 # --- Color Definitions ---
 GREEN='\033[0;32m'
@@ -171,6 +171,7 @@ process_keytool_file() {
     local working_pass=""
     local ERR_FILE=$(mktemp)
     
+    # 1. Attempt with default passwords
     for pass in "${DEFAULT_PASSWORDS[@]}"; do
         alias_list=$(keytool -list -v -keystore "$filepath" -storepass "$pass" 2> /dev/null | grep "Alias name:" | awk -F': ' '{print $2}')
         if [ $? -eq 0 ] && [ -n "$alias_list" ]; then
@@ -179,6 +180,16 @@ process_keytool_file() {
         fi
     done
 
+    # 2. If passwords failed, try keytool with NO password (explicit fallback for JKS)
+    if [ -z "$alias_list" ]; then
+        alias_list=$(keytool -list -v -keystore "$filepath" -storepass "" 2> /dev/null | grep "Alias name:" | awk -F': ' '{print $2}')
+        if [ $? -eq 0 ] && [ -n "$alias_list" ]; then
+            echo "Note: Keystore opened successfully without a password." >&2
+            working_pass=""
+        fi
+    fi
+
+    # If we have an alias list from any of the above methods, process it
     if [ -n "$alias_list" ]; then
         local first_alias_output=true
         echo "$alias_list" | while read -r alias; do
@@ -196,18 +207,18 @@ process_keytool_file() {
         return
     fi
     
-    # --- Fallback for .p12 files using OpenSSL if keytool failed ---
+    # 3. Final fallback for .p12 files using OpenSSL
     if [[ "${filepath,,}" == *.p12 ]]; then
         local certs_pem_content
         certs_pem_content=$(openssl pkcs12 -in "$filepath" -nokeys -nodes -password pass:'' 2> "$ERR_FILE")
-        if [ $? -eq 0 ] && [ -n "$certs_pem_content" ]; then
-            echo "Note: Keystore password failed, using passwordless fallback for .p12 file." >&2
+        if [ $? -eq 0 ] && [ -n "$certs_pem_content" ];
+        then
+            echo "Note: Using OpenSSL passwordless fallback for .p12 file." >&2
             local first_cert_output=true
-            # Split the output into individual PEM certificates and process each one
+            local cert_count=0
             echo "$certs_pem_content" | awk '/BEGIN CERTIFICATE/,/END CERTIFICATE/' | while read -r single_cert_pem; do
                 if ! $first_cert_output; then echo ","; fi
                 first_cert_output=false
-                # Use a counter for a unique identifier in the filepath
                 ((cert_count++))
                 parse_valid_cert_to_json "${filepath} (entry ${cert_count})" "$single_cert_pem"
             done
@@ -217,7 +228,7 @@ process_keytool_file() {
     fi
     
     # If all attempts failed, generate the final error
-    generate_error_json "$filepath" "Could not access keystore. Tried default passwords and passwordless fallbacks."
+    generate_error_json "$filepath" "Could not access keystore. All password and passwordless attempts failed."
     rm "$ERR_FILE"
 }
 
