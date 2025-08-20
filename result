@@ -1,293 +1,273 @@
+#!/bin/bash
+
 # ==============================================================================
-# Script to find and analyze certificates on the filesystem using native PowerShell.
-# V20: Automatically scans all local fixed disks (C:, D:, etc.).
+# Script to find and analyze certificates on the filesystem using standard tools.
+# V9: Removes icons from console output and adds a passwordless fallback for .p12 files.
 # ==============================================================================
 
 # --- Configuration ---
-$OutputFile = "certificate_report_windows.json"
+OUTPUT_FILE="certificate_report_v9.json"
+# List of default passwords to try when opening keystores
+DEFAULT_PASSWORDS=("changeit" "password" "secret" "keystore" "") 
 
-# List of default passwords to try on keystores (.p12, .jks)
-$DefaultPasswords = @(
-    "changeit",
-    "password",
-    "secret",
-    "keystore",
-    $null, # Represents no password
-    ""     # Represents an empty password
-)
+# --- Color Definitions ---
+GREEN='\033[0;32m'
+RED='\033[0;31m'
+YELLOW='\033[1;33m'
+BLUE='\033[0;34m'
+BOLD='\033[1m'
+NC='\033[0m' # No Color
 
 # --- Global Data ---
-$CurrentMachineName = $env:COMPUTERNAME
-$CurrentMachineIP = (Get-NetIPAddress -AddressFamily IPv4 -InterfaceAlias (Get-NetAdapter -Physical).Name | Where-Object { $_.AddressState -eq 'Preferred' }).IPAddress | Select-Object -First 1
+CURRENT_MACHINE_NAME=$(hostname)
+CURRENT_MACHINE_IP=$(hostname -I | awk '{print $1}')
+KEYTOOL_AVAILABLE=false
 
 # ==============================================================================
-# Function: Converts a certificate object to a PSCustomObject for further processing.
+# Function: Checks for required and optional dependencies.
 # ==============================================================================
-Function Convert-CertificateToCustomObject {
-    param(
-        [Parameter(Mandatory=$true)]
-        [System.Security.Cryptography.X509Certificates.X509Certificate2]$Certificate,
-        [Parameter(Mandatory=$true)]
-        [string]$FilePath,
-        [string]$Alias
-    )
-
-    $now = Get-Date
-
-    $statusText = ""
-    $statusColor = ""
-    $isValid = $false
-    $daysRemaining = (New-TimeSpan -Start $now -End $Certificate.NotAfter).Days
-
-    if ($now -lt $Certificate.NotBefore) {
-        $statusText = "INACTIVE (Not yet valid)"
-        $statusColor = "Red"
-    } elseif ($now -gt $Certificate.NotAfter) {
-        $statusText = "EXPIRED"
-        $statusColor = "Red"
-    } else {
-        $isValid = $true
-        if ($daysRemaining -le 30) {
-            $statusText = "VALID (Expires in $($daysRemaining) days!)"
-            $statusColor = "Yellow"
-        } else {
-            $statusText = "VALID (Expires in $($daysRemaining) days)"
-            $statusColor = "Green"
-        }
-    }
+check_dependencies() {
+    # Check for mandatory tools
+    for cmd in find openssl; do
+        if ! command -v "$cmd" &> /dev/null; then
+            echo -e "${RED}FATAL ERROR: Required tool '$cmd' is not installed. Exiting.${NC}" >&2
+            exit 1
+        fi
+    done
     
-    # Display human-readable information in the console
-    Write-Host "Certificate Details:" -ForegroundColor Green
-    if ($Alias) {
-        Write-Host "     Alias:   $Alias"
-    }
-    Write-Host "     Issuer:  $($Certificate.Issuer)"
-    Write-Host "     Status:  " -NoNewline; Write-Host $statusText -ForegroundColor $statusColor
-    Write-Host "     Validity:From $($Certificate.NotBefore.ToString('yyyy-MM-dd')) to $($Certificate.NotAfter.ToString('yyyy-MM-dd'))"
-
-    # Returns an object that will be converted to JSON
-    return [PSCustomObject]@{
-        filePath           = $FilePath
-        alias              = $Alias
-        issuer             = $Certificate.Issuer
-        subject            = $Certificate.Subject
-        validFrom          = $Certificate.NotBefore.ToUniversalTime().ToString("u").Replace(" ", "T")
-        validTo            = $Certificate.NotAfter.ToUniversalTime().ToString("u").Replace(" ", "T")
-        isValid            = $isValid
-        daysRemaining      = if ($daysRemaining -lt 0) { 0 } else { $daysRemaining }
-        thumbprint         = $Certificate.Thumbprint
-        currentMachineName = $CurrentMachineName
-        currentMachineIP   = $CurrentMachineIP
-    }
+    # Check for optional tool: keytool
+    if command -v "keytool" &> /dev/null; then
+        KEYTOOL_AVAILABLE=true
+    else
+        echo -e "${YELLOW}WARNING: 'keytool' utility not found. Java KeyStore files (.jks, etc.) will be skipped.${NC}" >&2
+    fi
 }
 
 # ==============================================================================
-# Function: Creates an error object to be saved in JSON.
+# Function: Escapes a string for use as a JSON value.
 # ==============================================================================
-Function New-ErrorObject {
-    param(
-        [Parameter(Mandatory=$true)]
-        [string]$FilePath,
-        [Parameter(Mandatory=$true)]
-        [string]$ErrorMessage
-    )
-    
-    # Display the error in the console
-    Write-Host "Error Found:" -ForegroundColor Red
-    Write-Host "     File:  $FilePath"
-    Write-Host "     Error: $($ErrorMessage.Trim())"
-
-    return [PSCustomObject]@{
-        filePath           = $FilePath
-        error              = $ErrorMessage.Trim()
-        currentMachineName = $CurrentMachineName
-        currentMachineIP   = $CurrentMachineIP
-    }
+json_escape() {
+    echo -n "$1" | sed -e 's/\\/\\\\/g' -e 's/"/\\"/g' -e 's/\//\\\//g' -e 's/\b/\\b/g' -e 's/\f/\\f/g' -e 's/\n/\\n/g' -e 's/\r/\\r/g' -e 's/\t/\\t/g'
 }
 
 # ==============================================================================
-# Function: Processes standard certificate files (.cer, .crt, .pem, etc.)
+# Function: Prints and generates a JSON object for an error.
 # ==============================================================================
-Function Process-StandardCertificate {
-    param(
-        [Parameter(Mandatory=$true)]
-        [System.IO.FileInfo]$File
-    )
-    try {
-        $fileBytes = [System.IO.File]::ReadAllBytes($File.FullName)
-        $cert = [System.Security.Cryptography.X509Certificates.X509Certificate2]::new($fileBytes)
-        return @(Convert-CertificateToCustomObject -Certificate $cert -FilePath $File.FullName)
-    } catch {
-        return @(New-ErrorObject -FilePath $File.FullName -ErrorMessage $_.Exception.Message)
-    }
+generate_error_json() {
+    local filepath="$1"
+    local error_msg="$2"
+
+    if [ -z "$error_msg" ]; then
+        error_msg="Operation failed without a specific error message."
+    fi
+
+    printf "${RED}Error Found:${NC}\n" >&2
+    printf "     ${BOLD}File:${NC}  %s\n" "$filepath" >&2
+    printf "     ${BOLD}Error:${NC} %s\n" "$error_msg" | sed 's/.*: // ' >&2
+
+    local escaped_path=$(json_escape "$filepath")
+    local escaped_error=$(json_escape "$error_msg")
+
+    printf '{"filePath":"%s","error":"%s"}' "$escaped_path" "$escaped_error"
 }
 
 # ==============================================================================
-# Function: Processes PKCS#12 keystore files (.pfx, .p12)
+# Function: Prints and generates a JSON object for a valid certificate.
 # ==============================================================================
-Function Process-Pkcs12Keystore {
-    param(
-        [Parameter(Mandatory=$true)]
-        [System.IO.FileInfo]$File
-    )
+parse_valid_cert_to_json() {
+    local filepath="$1"
+    local cert_pem_content="$2"
+
+    local issuer=$(echo "$cert_pem_content" | openssl x509 -noout -issuer | sed 's/issuer=//')
+    local valid_from_str=$(echo "$cert_pem_content" | openssl x509 -noout -startdate | cut -d= -f2-)
+    local valid_to_str=$(echo "$cert_pem_content" | openssl x509 -noout -enddate | cut -d= -f2-)
+    local key_usage=$(echo "$cert_pem_content" | openssl x509 -noout -text | grep -A1 'X509v3 Key Usage:' | tail -n1 | sed 's/^\s*//')
     
-    $foundResults = [System.Collections.Generic.List[object]]::new()
-    $foundInKeystore = $false
-
-    try {
-        $fileBytes = [System.IO.File]::ReadAllBytes($File.FullName)
-
-        foreach ($pass in $DefaultPasswords) {
-            try {
-                $collection = [System.Security.Cryptography.X509Certificates.X509Certificate2Collection]::new()
-                $collection.Import($fileBytes, $pass, "Exportable,UserKeySet")
-                
-                if ($collection.Count -gt 0) {
-                    $foundInKeystore = $true
-                    foreach ($cert in $collection) {
-                        $alias_name = if($cert.FriendlyName){$cert.FriendlyName} else {$cert.Subject}
-                        $foundResults.Add((Convert-CertificateToCustomObject -Certificate $cert -FilePath $File.FullName -Alias $alias_name))
-                    }
-                    break 
-                }
-            } catch {
-                # This inner catch ignores incorrect password errors.
-            }
-        }
-
-        if (-not $foundInKeystore) {
-            $foundResults.Add((New-ErrorObject -FilePath $File.FullName -ErrorMessage "Could not access PKCS#12 keystore. Tried default passwords."))
-        }
-    } catch {
-        # This outer catch handles errors reading the file itself.
-        $foundResults.Add((New-ErrorObject -FilePath $File.FullName -ErrorMessage $_.Exception.Message))
-    }
+    local valid_from_ts=$(date -d "$valid_from_str" +%s 2>/dev/null)
+    local valid_to_ts=$(date -d "$valid_to_str" +%s 2>/dev/null)
+    local now_ts=$(date +%s)
     
-    return $foundResults
+    if [ -z "$valid_from_ts" ] || [ -z "$valid_to_ts" ]; then
+        generate_error_json "$filepath" "Failed to parse date strings: '$valid_from_str' / '$valid_to_str'"
+        return
+    fi
+    
+    local valid_from_iso=$(date -d "@$valid_from_ts" -u --iso-8601=seconds)
+    local valid_to_iso=$(date -d "@$valid_to_ts" -u --iso-8601=seconds)
+    local days_valid=$(( (valid_to_ts - valid_from_ts) / 86400 ))
+
+    local status_color
+    local status_text
+    local is_valid
+    if (( now_ts > valid_to_ts || now_ts < valid_from_ts )); then
+        status_color="${RED}"
+        status_text="EXPIRED / INACTIVE"
+        is_valid="false"
+    else
+        is_valid="true"
+        local seconds_remaining=$((valid_to_ts - now_ts))
+        local days_remaining=$((seconds_remaining / 86400))
+        if [ "$days_remaining" -le 30 ]; then
+            status_color="${YELLOW}"
+            status_text="VALID (Expires in ${days_remaining} days!)"
+        else
+            status_color="${GREEN}"
+            status_text="VALID (Expires in ${days_remaining} days)"
+        fi
+    fi
+    
+    printf "${GREEN}Certificate Details:${NC}\n" >&2
+    printf "     ${BOLD}Issuer:${NC}   %s\n" "$issuer" >&2
+    printf "     ${BOLD}Status:${NC}   %b%s${NC}\n" "$status_color" "$status_text" >&2
+    printf "     ${BOLD}Validity:${NC} From %s to %s (%d days total)\n" "$(date -d "$valid_from_str" '+%Y-%m-%d')" "$(date -d "$valid_to_str" '+%Y-%m-%d')" "$days_valid" >&2
+    if [ -n "$key_usage" ]; then printf "     ${BOLD}Usage:${NC}    %s\n" "$key_usage"; fi >&2
+
+    local json_output="{"
+    json_output+=$(printf '"filePath":"%s",' "$(json_escape "$filepath")")
+    if [ -n "$issuer" ]; then json_output+=$(printf '"issuer":"%s",' "$(json_escape "$issuer")"); fi
+    json_output+=$(printf '"validFrom":"%s",' "$(json_escape "$valid_from_iso")")
+    json_output+=$(printf '"validTo":"%s",' "$(json_escape "$valid_to_iso")")
+    json_output+=$(printf '"daysValid":%d,' "$days_valid")
+    json_output+=$(printf '"isValid":%s,' "$is_valid")
+    if [ -n "$key_usage" ]; then json_output+=$(printf '"keyUsage":"%s",' "$(json_escape "$key_usage")"); fi
+    json_output+=$(printf '"currentMachineName":"%s",' "$(json_escape "$CURRENT_MACHINE_NAME")")
+    json_output+=$(printf '"currentMachineIP":"%s",' "$(json_escape "$CURRENT_MACHINE_IP")")
+    
+    json_output=$(echo "${json_output%,}}")"}"
+    echo "$json_output"
 }
 
 # ==============================================================================
-# Function: Processes Java KeyStore files (.jks, .keystore)
+# Function: Processes standard certificate files (PEM, DER, etc.).
 # ==============================================================================
-Function Process-JavaKeystore {
-    param(
-        [Parameter(Mandatory=$true)]
-        [System.IO.FileInfo]$File,
-        [System.Management.Automation.CommandInfo]$KeytoolCommand
-    )
-
-    $foundResults = [System.Collections.Generic.List[object]]::new()
-
-    if (-not $KeytoolCommand) {
-        $foundResults.Add((New-ErrorObject -FilePath $File.FullName -ErrorMessage "keytool.exe is not available; the certificate cannot be scanned."))
-        return $foundResults
-    }
+process_openssl_file() {
+    local filepath="$1"
+    local cert_content
+    local exit_code
+    local ERR_FILE=$(mktemp)
     
-    $workingPass = $null
-    $aliases = @()
+    cert_content=$(openssl x509 -in "$filepath" -inform pem -passin pass:'' 2> "$ERR_FILE")
+    exit_code=$?
+    if [ $exit_code -eq 0 ]; then
+        parse_valid_cert_to_json "$filepath" "$cert_content"
+    else
+        cert_content=$(openssl x509 -in "$filepath" -inform der -passin pass:'' 2> "$ERR_FILE")
+        exit_code=$?
+        if [ $exit_code -eq 0 ]; then
+            parse_valid_cert_to_json "$filepath" "$cert_content"
+        else
+            generate_error_json "$filepath" "$(<"$ERR_FILE")"
+        fi
+    fi
+    rm "$ERR_FILE"
+}
 
-    foreach ($pass in $DefaultPasswords) {
-        $keytoolArgs = @('-list', '-v', '-keystore', $File.FullName)
-        if (-not [string]::IsNullOrEmpty($pass)) {
-            $keytoolArgs += @('-storepass', $pass)
-        }
-        $listOutput = $null | & $KeytoolCommand.Source @keytoolArgs 2>&1
-        
-        if ($LASTEXITCODE -eq 0) {
-            $workingPass = $pass
-            $aliases = $listOutput | Where-Object { $_ -match 'Alias name:' } | ForEach-Object { $_.Split(':')[1].Trim() }
+# ==============================================================================
+# Function: Processes Java KeyStore files (JKS, .p12, etc.).
+# ==============================================================================
+process_keytool_file() {
+    local filepath="$1"
+    local alias_list=""
+    local working_pass=""
+    local ERR_FILE=$(mktemp)
+    
+    for pass in "${DEFAULT_PASSWORDS[@]}"; do
+        alias_list=$(keytool -list -v -keystore "$filepath" -storepass "$pass" 2> /dev/null | grep "Alias name:" | awk -F': ' '{print $2}')
+        if [ $? -eq 0 ] && [ -n "$alias_list" ]; then
+            working_pass="$pass"
             break
-        }
-    }
+        fi
+    done
 
-    if ($aliases.Count -gt 0) {
-        foreach ($alias in $aliases) {
-             $exportArgs = @('-exportcert', '-alias', $alias, '-keystore', $File.FullName, '-rfc')
-             if (-not [string]::IsNullOrEmpty($workingPass)) {
-                 $exportArgs += @('-storepass', $workingPass)
-             }
-             $certPem = $null | & $KeytoolCommand.Source @exportArgs 2>&1
-
-             if ($LASTEXITCODE -eq 0) {
-                try {
-                    $singlePemString = $certPem -join "`n"
-                    if ($singlePemString -notlike '*-BEGIN CERTIFICATE-*') {
-                        throw "keytool did not return a valid PEM certificate. Output: $singlePemString"
-                    }
-
-                    $certBytes = [System.Text.Encoding]::UTF8.GetBytes($singlePemString)
-                    $cert = [System.Security.Cryptography.X509Certificates.X509Certificate2]::new($certBytes)
-                    $foundResults.Add((Convert-CertificateToCustomObject -Certificate $cert -FilePath $File.FullName -Alias $alias))
-                } catch {
-                    $foundResults.Add((New-ErrorObject -FilePath "$($File.FullName) (alias: $alias)" -ErrorMessage $_.Exception.Message))
-                }
-             } else {
-                 $foundResults.Add((New-ErrorObject -FilePath "$($File.FullName) (alias: $alias)" -ErrorMessage "Failed to export certificate from JKS: $($certPem -join "`n")"))
-             }
-        }
-    } else {
-        $foundResults.Add((New-ErrorObject -FilePath $File.FullName -ErrorMessage "Could not access JKS keystore or it contains no aliases. Tried default passwords."))
-    }
-    return $foundResults
+    if [ -n "$alias_list" ]; then
+        local first_alias_output=true
+        echo "$alias_list" | while read -r alias; do
+            if ! $first_alias_output; then echo ","; fi
+            first_alias_output=false
+            
+            cert_pem_content=$(keytool -exportcert -alias "$alias" -keystore "$filepath" -storepass "$working_pass" -rfc 2> "$ERR_FILE")
+            if [ $? -eq 0 ] && [ -n "$cert_pem_content" ]; then
+                parse_valid_cert_to_json "${filepath} (alias: ${alias})" "$cert_pem_content"
+            else
+                generate_error_json "${filepath} (alias: ${alias})" "$(<"$ERR_FILE")"
+            fi
+        done
+        rm "$ERR_FILE"
+        return
+    fi
+    
+    # --- Fallback for .p12 files using OpenSSL if keytool failed ---
+    if [[ "${filepath,,}" == *.p12 ]]; then
+        local certs_pem_content
+        certs_pem_content=$(openssl pkcs12 -in "$filepath" -nokeys -nodes -password pass:'' 2> "$ERR_FILE")
+        if [ $? -eq 0 ] && [ -n "$certs_pem_content" ]; then
+            echo "Note: Keystore password failed, using passwordless fallback for .p12 file." >&2
+            local first_cert_output=true
+            # Split the output into individual PEM certificates and process each one
+            echo "$certs_pem_content" | awk '/BEGIN CERTIFICATE/,/END CERTIFICATE/' | while read -r single_cert_pem; do
+                if ! $first_cert_output; then echo ","; fi
+                first_cert_output=false
+                # Use a counter for a unique identifier in the filepath
+                ((cert_count++))
+                parse_valid_cert_to_json "${filepath} (entry ${cert_count})" "$single_cert_pem"
+            done
+            rm "$ERR_FILE"
+            return
+        fi
+    fi
+    
+    # If all attempts failed, generate the final error
+    generate_error_json "$filepath" "Could not access keystore. Tried default passwords and passwordless fallbacks."
+    rm "$ERR_FILE"
 }
 
-
 # ==============================================================================
-# Main script logic
+# Main script function
 # ==============================================================================
-Function Main {
-    Write-Host "Starting certificate scan on all local disks..." -ForegroundColor Cyan
-    $keytoolCmd = Get-Command keytool -ErrorAction SilentlyContinue
-
-    if (-not $keytoolCmd) {
-        Write-Host "INFO: 'keytool.exe' not found. Java KeyStore files (.jks) will be reported as unscannable." -ForegroundColor Yellow
-    }
-
-    # Get all local fixed disks (e.g., C:, D:)
-    $localDisks = Get-CimInstance -ClassName Win32_LogicalDisk -Filter "DriveType=3"
-    Write-Host "Found local disks to scan: $($localDisks.DeviceID -join ', ')" -ForegroundColor Cyan
-
-    $allResults = [System.Collections.Generic.List[object]]::new()
-    $extensions = @("*.cer", "*.crt", "*.der", "*.pem", "*.p7b", "*.p7c", "*.pfx", "*.p12", "*.jks", "*.keystore")
+main() {
+    check_dependencies
+    echo -e "${BLUE}Starting certificate scan...${NC}" >&2
     
-    # Loop through each disk and scan it
-    foreach ($disk in $localDisks) {
-        $searchPath = Join-Path -Path $disk.DeviceID -ChildPath "\"
-        Write-Host "--- Now scanning disk: $searchPath ---" -ForegroundColor Cyan
+    echo "[" > "$OUTPUT_FILE"
+    local is_first_entry=true
 
-        Get-ChildItem -Path $searchPath -Recurse -Include $extensions -ErrorAction SilentlyContinue | ForEach-Object {
-            $file = $_
-            Write-Host "----------------------------------------------------------------------"
-            Write-Host "Processing: $($file.FullName)" -ForegroundColor White
-            
-            $fileResults = @()
-            
-            switch -Wildcard ($file.Extension.ToLower()) {
-                ".cer"      { $fileResults = Process-StandardCertificate -File $file }
-                ".crt"      { $fileResults = Process-StandardCertificate -File $file }
-                ".der"      { $fileResults = Process-StandardCertificate -File $file }
-                ".pem"      { $fileResults = Process-StandardCertificate -File $file }
-                ".p7b"      { $fileResults = Process-StandardCertificate -File $file }
-                ".p7c"      { $fileResults = Process-StandardCertificate -File $file }
-                ".pfx"      { $fileResults = Process-Pkcs12Keystore -File $file }
-                ".p12"      { $fileResults = Process-Pkcs12Keystore -File $file }
-                ".jks"      { $fileResults = Process-JavaKeystore -File $file -KeytoolCommand $keytoolCmd }
-                ".keystore" { $fileResults = Process-JavaKeystore -File $file -KeytoolCommand $keytoolCmd }
-            }
-            if ($fileResults) {
-                foreach ($result in $fileResults) {
-                    $allResults.Add($result)
-                }
-            }
-        }
-    }
-    
-    $allResults | ConvertTo-Json -Depth 5 | Out-File -FilePath $OutputFile -Encoding utf8
-    
-    Write-Host ""
-    Write-Host "Finished. Results have been saved to: " -ForegroundColor Cyan -NoNewline
-    Write-Host $OutputFile -ForegroundColor White
+    find / -type f \( \
+        -iname "*.cer" -o -iname "*.crt" -o -iname "*.der" -o -iname "*.pem" -o \
+        -iname "*.p7c" -o -iname "*.jks" -o -iname "*.keystore" -o -iname "*.p12" \
+    \) 2>/dev/null | while read -r filepath; do
+        printf -- "----------------------------------------------------------------------\n" >&2
+        echo -e "${BOLD}Processing:${NC} $filepath" >&2
+        
+        local result_json
+        case "${filepath,,}" in
+            *.cer|*.crt|*.der|*.pem|*.p7c)
+                result_json=$(process_openssl_file "$filepath")
+                ;;
+            *.jks|*.keystore|*.p12)
+                if $KEYTOOL_AVAILABLE; then
+                    result_json=$(process_keytool_file "$filepath")
+                else
+                    result_json=$(generate_error_json "$filepath" "Cannot process keystore: 'keytool' utility is not installed.")
+                fi
+                ;;
+            *)
+                continue
+                ;;
+        esac
+
+        if [ -n "$result_json" ]; then
+            if $is_first_entry; then
+                is_first_entry=false
+            else
+                echo "," >> "$OUTPUT_FILE"
+            fi
+            echo "$result_json" >> "$OUTPUT_FILE"
+        fi
+    done
+
+    echo "]" >> "$OUTPUT_FILE"
 }
 
-# --- Script Execution ---
-Main
+# --- Execution ---
+main
+echo -e "\n${BLUE}Finished. Results have been saved to: ${BOLD}$OUTPUT_FILE${NC}" >&2
