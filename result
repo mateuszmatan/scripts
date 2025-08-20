@@ -1,6 +1,6 @@
 # ==============================================================================
 # Script to find and analyze certificates on the filesystem using native PowerShell.
-# V9: Fixed null parameter error by explicitly passing passwords into Main.
+# V10: Adds debugging and a safety check for the password list parameter.
 # ==============================================================================
 
 # --- Configuration ---
@@ -16,6 +16,8 @@ $DefaultPasswords = @(
     $null, # Represents no password
     ""     # Represents an empty password
 )
+# --- DEBUG LINE ---
+Write-Host "DEBUG: At global scope, DefaultPasswords variable has $($DefaultPasswords.Count) items." -ForegroundColor Magenta
 
 # --- Global Data ---
 $CurrentMachineName = $env:COMPUTERNAME
@@ -34,6 +36,9 @@ Function Convert-CertificateToCustomObject {
     )
 
     $now = Get-Date
+    # Using the current date of August 20, 2025
+    # $now = [datetime]"2025-08-20T10:46:21"
+
     $statusText = ""
     $statusColor = ""
     $isValid = $false
@@ -223,10 +228,18 @@ Function Process-JavaKeystore {
 # Main script logic
 # ==============================================================================
 Function Main {
-    # FIX: Added a param block to accept the password list explicitly.
     param (
         [array]$PasswordList
     )
+
+    # --- SAFETY CHECK & DEBUG ---
+    if ($null -eq $PasswordList) {
+        Write-Host "FATAL ERROR: The password list was not provided to the Main function. Stopping execution." -ForegroundColor Red
+        Write-Host "This usually happens if you run a selection of the script instead of the whole file." -ForegroundColor Yellow
+        return # Stop the function
+    } else {
+        Write-Host "DEBUG: Main function received a PasswordList with $($PasswordList.Count) items." -ForegroundColor Magenta
+    }
 
     Write-Host "Starting certificate scan on '$SearchPath'..." -ForegroundColor Cyan
     $hasKeytool = (Get-Command keytool -ErrorAction SilentlyContinue)
@@ -246,40 +259,16 @@ Function Main {
         $fileResults = @()
         
         switch -Wildcard ($file.Extension.ToLower()) {
-            ".cer" {
-                $fileResults = Process-StandardCertificate -File $file
-            }
-            ".crt" {
-                $fileResults = Process-StandardCertificate -File $file
-            }
-            ".der" {
-                $fileResults = Process-StandardCertificate -File $file
-            }
-            ".pem" {
-                $fileResults = Process-StandardCertificate -File $file
-            }
-            ".p7b" {
-                $fileResults = Process-StandardCertificate -File $file
-            }
-            ".p7c" {
-                $fileResults = Process-StandardCertificate -File $file
-            }
-            ".pfx" {
-                # FIX: Using the $PasswordList parameter passed into Main.
-                $fileResults = Process-Pkcs12Keystore -File $file -DefaultPasswords $PasswordList
-            }
-            ".p12" {
-                # FIX: Using the $PasswordList parameter passed into Main.
-                $fileResults = Process-Pkcs12Keystore -File $file -DefaultPasswords $PasswordList
-            }
-            ".jks" {
-                # FIX: Using the $PasswordList parameter passed into Main.
-                $fileResults = Process-JavaKeystore -File $file -DefaultPasswords $PasswordList -HasKeytool $hasKeytool
-            }
-            ".keystore" {
-                # FIX: Using the $PasswordList parameter passed into Main.
-                $fileResults = Process-JavaKeystore -File $file -DefaultPasswords $PasswordList -HasKeytool $hasKeytool
-            }
+            ".cer" { $fileResults = Process-StandardCertificate -File $file }
+            ".crt" { $fileResults = Process-StandardCertificate -File $file }
+            ".der" { $fileResults = Process-StandardCertificate -File $file }
+            ".pem" { $fileResults = Process-StandardCertificate -File $file }
+            ".p7b" { $fileResults = Process-StandardCertificate -File $file }
+            ".p7c" { $fileResults = Process-StandardCertificate -File $file }
+            ".pfx" { $fileResults = Process-Pkcs12Keystore -File $file -DefaultPasswords $PasswordList }
+            ".p12" { $fileResults = Process-Pkcs12Keystore -File $file -DefaultPasswords $PasswordList }
+            ".jks" { $fileResults = Process-JavaKeystore -File $file -DefaultPasswords $PasswordList -HasKeytool $hasKeytool }
+            ".keystore" { $fileResults = Process-JavaKeystore -File $file -DefaultPasswords $PasswordList -HasKeytool $hasKeytool }
         }
         if ($fileResults) {
             foreach ($result in $fileResults) {
@@ -296,5 +285,4 @@ Function Main {
 }
 
 # --- Script Execution ---
-# FIX: Pass the global $DefaultPasswords array into the Main function.
 Main -PasswordList $DefaultPasswords
