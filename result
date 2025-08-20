@@ -1,14 +1,219 @@
-At C:\Scripts\search_win.ps1:216 char:57
-+ ... ished. Results have been saved to: " -ForegroundColor Cyan -NoNewline
-+                                        ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-The string is missing the terminator: ".
-At C:\Scripts\search_win.ps1:125 char:114
-+ ... -Include $extensions -ErrorAction SilentlyContinue | ForEach-Object {
-+                                                                         ~
-Missing closing '}' in statement block or type definition.
-At C:\Scripts\search_win.ps1:111 char:15
-+ Function Main {
-+               ~
-Missing closing '}' in statement block or type definition.
-    + CategoryInfo          : ParserError: (:) [], ParseException
-    + FullyQualifiedErrorId : TerminatorExpectedAtEndOfString
+# ==============================================================================
+# Script to find and analyze certificates on the filesystem using native PowerShell.
+# V3: Fixes parsing errors and improves external command handling for keytool.
+# ==============================================================================
+
+# --- Configuration ---
+$OutputFile = "certificate_report_windows.json"
+$SearchPath = "C:\" # Path to scan. Can be changed to e.g., "C:\Users" for a faster scan.
+
+# List of default passwords to try on keystores (.p12, .jks)
+$DefaultPasswords = @(
+    "changeit",
+    "password",
+    "secret",
+    "keystore",
+    $null, # Represents no password
+    ""     # Represents an empty password
+)
+
+# --- Global Data ---
+$CurrentMachineName = $env:COMPUTERNAME
+$CurrentMachineIP = (Get-NetIPAddress -AddressFamily IPv4 -InterfaceAlias (Get-NetAdapter -Physical).Name | Where-Object { $_.AddressState -eq 'Preferred' }).IPAddress | Select-Object -First 1
+
+# ==============================================================================
+# Function: Converts a certificate object to a PSCustomObject for further processing.
+# ==============================================================================
+Function Convert-CertificateToCustomObject {
+    param(
+        [Parameter(Mandatory=$true)]
+        [System.Security.Cryptography.X509Certificates.X509Certificate2]$Certificate,
+        [Parameter(Mandatory=$true)]
+        [string]$FilePath,
+        [string]$Alias
+    )
+
+    $now = Get-Date
+    $statusText = ""
+    $statusColor = ""
+    $isValid = $false
+    $daysRemaining = (New-TimeSpan -Start $now -End $Certificate.NotAfter).Days
+
+    if ($now -lt $Certificate.NotBefore) {
+        $statusText = "INACTIVE (Not yet valid)"
+        $statusColor = "Red"
+    } elseif ($now -gt $Certificate.NotAfter) {
+        $statusText = "EXPIRED"
+        $statusColor = "Red"
+    } else {
+        $isValid = $true
+        if ($daysRemaining -le 30) {
+            $statusText = "VALID (Expires in $($daysRemaining) days!)"
+            $statusColor = "Yellow"
+        } else {
+            $statusText = "VALID (Expires in $($daysRemaining) days)"
+            $statusColor = "Green"
+        }
+    }
+    
+    # Display human-readable information in the console
+    Write-Host "✅ Certificate Details:" -ForegroundColor Green
+    if ($Alias) {
+        Write-Host "     Alias:   $Alias"
+    }
+    Write-Host "     Issuer:  $($Certificate.Issuer)"
+    Write-Host "     Status:  " -NoNewline; Write-Host $statusText -ForegroundColor $statusColor
+    Write-Host "     Validity:From $($Certificate.NotBefore.ToString('yyyy-MM-dd')) to $($Certificate.NotAfter.ToString('yyyy-MM-dd'))"
+
+    # Returns an object that will be converted to JSON
+    return [PSCustomObject]@{
+        filePath           = $FilePath
+        alias              = $Alias
+        issuer             = $Certificate.Issuer
+        subject            = $Certificate.Subject
+        validFrom          = $Certificate.NotBefore.ToUniversalTime().ToString("u").Replace(" ", "T")
+        validTo            = $Certificate.NotAfter.ToUniversalTime().ToString("u").Replace(" ", "T")
+        isValid            = $isValid
+        daysRemaining      = if ($daysRemaining -lt 0) { 0 } else { $daysRemaining }
+        thumbprint         = $Certificate.Thumbprint
+        currentMachineName = $CurrentMachineName
+        currentMachineIP   = $CurrentMachineIP
+    }
+}
+
+# ==============================================================================
+# Function: Creates an error object to be saved in JSON.
+# ==============================================================================
+Function New-ErrorObject {
+    param(
+        [Parameter(Mandatory=$true)]
+        [string]$FilePath,
+        [Parameter(Mandatory=$true)]
+        [string]$ErrorMessage
+    )
+    
+    # Display the error in the console
+    Write-Host "❌ Error Found:" -ForegroundColor Red
+    Write-Host "     File:  $FilePath"
+    Write-Host "     Error: $($ErrorMessage.Trim())"
+
+    return [PSCustomObject]@{
+        filePath           = $FilePath
+        error              = $ErrorMessage.Trim()
+        currentMachineName = $CurrentMachineName
+        currentMachineIP   = $CurrentMachineIP
+    }
+}
+
+# ==============================================================================
+# Main script logic
+# ==============================================================================
+Function Main {
+    Write-Host "Starting certificate scan on '$SearchPath'..." -ForegroundColor Cyan
+    # Check for keytool once at the beginning for efficiency
+    $hasKeytool = (Get-Command keytool -ErrorAction SilentlyContinue)
+
+    if (-not $hasKeytool) {
+        Write-Host "INFO: 'keytool.exe' not found. Java KeyStore files (.jks) will be reported as unscannable." -ForegroundColor Yellow
+    }
+
+    $allResults = [System.Collections.Generic.List[object]]::new()
+    
+    $extensions = @("*.cer", "*.crt", "*.der", "*.pem", "*.p7b", "*.p7c", "*.pfx", "*.p12", "*.jks", "*.keystore")
+    
+    # -ErrorAction SilentlyContinue skips access denied errors on folders
+    Get-ChildItem -Path $SearchPath -Recurse -Include $extensions -ErrorAction SilentlyContinue | ForEach-Object {
+        $file = $_
+        Write-Host "----------------------------------------------------------------------"
+        Write-Host "🔎 Processing: $($file.FullName)" -ForegroundColor White
+        
+        try {
+            switch -Wildcard ($file.Extension.ToLower()) {
+                ".cer" -or ".crt" -or ".der" -or ".pem" -or ".p7b" -or ".p7c" {
+                    $cert = New-Object System.Security.Cryptography.X509Certificates.X509Certificate2($file.FullName)
+                    $allResults.Add((Convert-CertificateToCustomObject -Certificate $cert -FilePath $file.FullName))
+                }
+                ".pfx" -or ".p12" {
+                    $foundInKeystore = $false
+                    foreach ($pass in $DefaultPasswords) {
+                        try {
+                            $collection = New-Object System.Security.Cryptography.X509Certificates.X509Certificate2Collection
+                            $collection.Import($file.FullName, $pass, "Exportable,UserKeySet")
+                            
+                            if ($collection.Count -gt 0) {
+                                $foundInKeystore = $true
+                                foreach ($cert in $collection) {
+                                    if ($cert.HasPrivateKey) {
+                                        $allResults.Add((Convert-CertificateToCustomObject -Certificate $cert -FilePath $file.FullName -Alias "Cert with Private Key"))
+                                    }
+                                }
+                                break 
+                            }
+                        } catch {
+                            # Ignore incorrect password errors and try the next one
+                        }
+                    }
+                    if (-not $foundInKeystore) {
+                        $allResults.Add((New-ErrorObject -FilePath $file.FullName -ErrorMessage "Could not access PKCS#12 keystore. Tried default passwords."))
+                    }
+                }
+                ".jks" -or ".keystore" {
+                    if (-not $hasKeytool) {
+                        $allResults.Add((New-ErrorObject -FilePath $file.FullName -ErrorMessage "keytool.exe is not available; the certificate cannot be scanned."))
+                        continue # Skip to the next file in the loop
+                    }
+                    
+                    $workingPass = $null
+                    $aliases = @()
+
+                    foreach ($pass in $DefaultPasswords) {
+                        $keytoolArgs = @('-list', '-v', '-keystore', $file.FullName)
+                        if (-not [string]::IsNullOrEmpty($pass)) {
+                            $keytoolArgs += @('-storepass', $pass)
+                        }
+                        $listOutput = & keytool @keytoolArgs 2>&1
+                        
+                        if ($LASTEXITCODE -eq 0) {
+                            $workingPass = $pass
+                            $aliases = $listOutput | Where-Object { $_ -match 'Alias name:' } | ForEach-Object { $_.Split(':')[1].Trim() }
+                            break
+                        }
+                    }
+
+                    if ($aliases.Count -gt 0) {
+                        foreach ($alias in $aliases) {
+                             $exportArgs = @('-exportcert', '-alias', $alias, '-keystore', $file.FullName, '-rfc')
+                             if (-not [string]::IsNullOrEmpty($workingPass)) {
+                                 $exportArgs += @('-storepass', $workingPass)
+                             }
+                             $certPem = & keytool @exportArgs 2>&1
+
+                             if ($LASTEXITCODE -eq 0) {
+                                 $certBytes = [System.Text.Encoding]::UTF8.GetBytes($certPem)
+                                 $cert = New-Object System.Security.Cryptography.X509Certificates.X509Certificate2($certBytes)
+                                 $allResults.Add((Convert-CertificateToCustomObject -Certificate $cert -FilePath $file.FullName -Alias $alias))
+                             } else {
+                                 $allResults.Add((New-ErrorObject -FilePath "$($file.FullName) (alias: $alias)" -ErrorMessage "Failed to export certificate from JKS: $certPem"))
+                             }
+                        }
+                    } else {
+                        $allResults.Add((New-ErrorObject -FilePath $file.FullName -ErrorMessage "Could not access JKS keystore or it contains no aliases. Tried default passwords."))
+                    }
+                }
+            }
+        } catch {
+            # Catch a generic error if, for example, the file is corrupted
+            $allResults.Add((New-ErrorObject -FilePath $file.FullName -ErrorMessage $_.Exception.Message))
+        }
+    }
+    
+    # Save all results to the JSON file
+    $allResults | ConvertTo-Json -Depth 5 | Out-File -FilePath $OutputFile -Encoding utf8
+    
+    # This is the line that most likely causes the error if quotes are copied incorrectly.
+    Write-Host "`nFinished. Results have been saved to: " -ForegroundColor Cyan -NoNewline
+    Write-Host $OutputFile -ForegroundColor White
+}
+
+# --- Script Execution ---
+Main
